@@ -381,8 +381,9 @@ class SimplefinItem::Importer
     def import_with_chunked_history
       # SimpleFin's actual limit is 60 days per request (not 365 as documented).
       # SimpleFin typically only provides 60-90 days of history (bank-dependent).
-      # Use adaptive chunking: start with 2 chunks, continue if new data found,
-      # stop after 2 consecutive empty chunks. Max 6 chunks (360 days) for safety.
+      # Use adaptive chunking: continue while linked accounts return settled
+      # history, and stop after 2 consecutive empty chunks. Max 6 chunks (360
+      # days) for safety.
       chunk_size_days = 60
       max_requests = 6  # Down from 22 - SimpleFIN rarely provides >90 days anyway
       current_end_date = Time.current
@@ -482,15 +483,19 @@ class SimplefinItem::Importer
         new_txns_in_chunk = [ post_chunk_tx_count - pre_chunk_tx_count, 0 ].max
         total_new_transactions += new_txns_in_chunk
 
-        # Adaptive stopping is driven by what SimpleFIN returned for this window,
-        # not by growth of the stored payloads: nothing is linked yet during the
-        # claim-time sync, and the setup-time sync re-fetches transactions the
-        # claim-time sync already stored, so growth would read zero while the
-        # window still has history. Only settled transactions dated inside the
-        # window count, so pending rows or out-of-window rows that come back with
-        # every request cannot keep the walk going.
+        # Adaptive stopping is driven by settled history returned for linked
+        # accounts, rather than payload growth. Payload growth can be zero when a
+        # window re-fetches an already-stored transaction, while counting skipped
+        # accounts would make routine syncs exhaust the request cap. Only rows
+        # dated inside the window count, so repeated pending or out-of-window rows
+        # cannot keep the walk going.
         window = chunk_start_date.to_i..chunk_end_date.to_i
+        linked_account_ids = simplefin_item.simplefin_accounts.reload.filter_map do |sfa|
+          sfa.account_id if sfa.current_account.present?
+        end.to_set
         returned_txns_in_chunk = accounts_data[:accounts].to_a.sum do |a|
+          next 0 unless linked_account_ids.include?(a[:id].to_s)
+
           a[:transactions].to_a.count { |t| settled_in_window?(t, window) }
         end
 
@@ -533,7 +538,7 @@ class SimplefinItem::Importer
 
     # Count total transactions in linked SimpleFIN accounts (for chunked sync stats)
     def count_linked_transactions
-      simplefin_item.simplefin_accounts
+      simplefin_item.simplefin_accounts.reload
         .select { |sfa| sfa.current_account.present? }
         .sum { |sfa| sfa.raw_transactions_payload.to_a.size }
     end

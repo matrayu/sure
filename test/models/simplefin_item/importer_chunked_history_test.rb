@@ -2,9 +2,8 @@ require "test_helper"
 
 # The chunked backfill walks back in 60-day windows and stops after two
 # consecutive windows with no history. Whether a window "had history" must come
-# from what SimpleFIN returned for it, not from how much the stored payloads grew:
-# on a new connection nothing is linked yet during the claim-time sync, and the
-# setup-time sync re-fetches transactions the claim-time sync already stored.
+# from settled, in-window transactions returned for linked accounts, not solely
+# from how much their stored payloads grew.
 class SimplefinItem::ImporterChunkedHistoryTest < ActiveSupport::TestCase
   setup do
     @family = families(:dylan_family)
@@ -16,9 +15,14 @@ class SimplefinItem::ImporterChunkedHistoryTest < ActiveSupport::TestCase
     @importer = SimplefinItem::Importer.new(@item, simplefin_provider: nil)
     @importer.stubs(:perform_account_discovery)
     @item.stubs(:upsert_simplefin_snapshot!)
+    @simplefin_account = @item.simplefin_accounts.create!(
+      name: "Checking", account_id: "sf_checking", account_type: "checking",
+      currency: "USD", current_balance: 100, raw_transactions_payload: []
+    )
+    accounts(:depository).update!(simplefin_account_id: @simplefin_account.id)
   end
 
-  test "keeps walking back while windows return history when no account is linked yet" do
+  test "public import keeps walking and reports payload growth for a newly linked account" do
     # Three windows of history, then nothing older.
     stub_windows(
       [ tx("t1", 10.days.ago) ],
@@ -28,22 +32,19 @@ class SimplefinItem::ImporterChunkedHistoryTest < ActiveSupport::TestCase
       []
     )
 
-    @importer.send(:import_with_chunked_history)
+    @importer.import
 
     history = @importer.send(:stats)["chunked_history"]
     assert_equal 5, history["chunks_processed"]
     assert_equal "no_new_data", history["reason"]
+    assert_equal 3, history["total_new_transactions"]
     assert_equal %w[t1 t2 t3], stored_transaction_ids
   end
 
   test "keeps walking back when the first windows re-fetch transactions already stored" do
-    # The claim-time sync already stored the two most recent windows.
-    sfa = @item.simplefin_accounts.create!(
-      name: "Checking", account_id: "sf_checking", account_type: "checking",
-      currency: "USD", current_balance: 100,
+    @simplefin_account.update!(
       raw_transactions_payload: [ tx("t1", 10.days.ago), tx("t2", 70.days.ago) ]
     )
-    accounts(:depository).update!(simplefin_account_id: sfa.id)
 
     stub_windows(
       [ tx("t1", 10.days.ago) ],
@@ -70,20 +71,37 @@ class SimplefinItem::ImporterChunkedHistoryTest < ActiveSupport::TestCase
     assert_equal %w[t1], stored_transaction_ids
   end
 
-  test "counts history from every account in a window, not just the first" do
+  test "history from an unlinked account does not keep the walk going" do
     quiet = ->(txns) { { id: "sf_savings", name: "Savings", currency: "USD", balance: "5.00", "balance-date": Time.current.to_i, transactions: txns } }
     busy = ->(txns) { { id: "sf_checking", name: "Checking", currency: "USD", balance: "100.00", "balance-date": Time.current.to_i, transactions: txns } }
     @importer.stubs(:fetch_accounts_data).returns(
-      { accounts: [ quiet.call([]), busy.call([ tx("t1", 10.days.ago) ]) ] },
-      { accounts: [ quiet.call([]), busy.call([ tx("t2", 70.days.ago) ]) ] },
-      { accounts: [ quiet.call([]), busy.call([ tx("t3", 130.days.ago) ]) ] },
-      { accounts: [ quiet.call([]), busy.call([]) ] },
-      { accounts: [ quiet.call([]), busy.call([]) ] }
+      { accounts: [ busy.call([ tx("t1", 10.days.ago) ]), quiet.call([ tx("s1", 10.days.ago) ]) ] },
+      { accounts: [ busy.call([]), quiet.call([ tx("s2", 70.days.ago) ]) ] },
+      { accounts: [ busy.call([]), quiet.call([ tx("s3", 130.days.ago) ]) ] },
+      { accounts: [ busy.call([ tx("t4", 190.days.ago) ]), quiet.call([]) ] }
     )
 
     @importer.send(:import_with_chunked_history)
 
-    assert_equal %w[t1 t2 t3], stored_transaction_ids
+    history = @importer.send(:stats)["chunked_history"]
+    assert_equal 3, history["chunks_processed"]
+    assert history["stopped_early"]
+  end
+
+  test "settled rows outside the requested windows do not keep the walk going" do
+    old_transaction = tx("old", 2.years.ago)
+    stub_windows(
+      [ tx("t1", 10.days.ago), old_transaction ],
+      [ old_transaction ],
+      [ old_transaction ],
+      [ tx("t4", 190.days.ago) ]
+    )
+
+    @importer.send(:import_with_chunked_history)
+
+    history = @importer.send(:stats)["chunked_history"]
+    assert_equal 3, history["chunks_processed"]
+    assert history["stopped_early"]
   end
 
   test "pending rows returned with every window do not keep the walk going" do
